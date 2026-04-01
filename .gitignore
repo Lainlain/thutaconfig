@@ -1,0 +1,6 @@
+*.db
+*.db-shm
+*.db-wal
+appconfig-server
+.env
+*.log
