@@ -365,3 +365,4 @@ Part of Burma 2D 2025 project.
 # burma2dconfig
 # 2dexpectconfig
 # thutaconfig
+# bettingconfig
