@@ -1,16 +1,47 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// loadEnvFile reads key=value pairs from a .env file and sets them as
+// environment variables (only if not already set by the OS).
+func loadEnvFile(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return // no .env file — that's fine
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		if os.Getenv(key) == "" { // don't override real env vars
+			os.Setenv(key, val)
+		}
+	}
+}
 
 var db *sql.DB
 
@@ -24,12 +55,17 @@ type AppVersion struct {
 	UpdateMessage      string   `json:"um"`
 	WhatsNew           []string `json:"wn"`
 	ReleaseDate        string   `json:"rd"`
+	DownloadURL        string   `json:"du"`      // Universal / fallback APK link
+	DownloadURLv8a     string   `json:"du_v8a"`  // arm64-v8a APK (modern phones)
+	DownloadURLv7a     string   `json:"du_v7a"`  // armeabi-v7a APK (older phones)
+	UpdateButtonText   string   `json:"ubt"`     // e.g. "ယခုဒေါင်းလုပ်"
+	LaterButtonText    string   `json:"lbt"`     // e.g. "နောက်မှ" (empty = hide)
 }
 
-// InAppMessage represents an in-app announcement/message
+// InAppMessage represents an in-app announcement shown as a bottom sheet
 type InAppMessage struct {
 	ID          string `json:"i"`
-	Type        string `json:"tp"`
+	Type        string `json:"tp"` // info | promo | warning
 	Title       string `json:"tt"`
 	Message     string `json:"mg"`
 	ImageURL    string `json:"iu,omitempty"`
@@ -42,25 +78,29 @@ type InAppMessage struct {
 	Dismissible bool   `json:"dm"`
 }
 
-// AdConfig represents ad-related configuration
-type AdConfig struct {
-	NativeAdTimerSeconds int `json:"nt"` // Timer in seconds (60, 90, 120, etc.)
-}
-
-// AdUnits represents AdMob ad unit IDs
-type AdUnits struct {
-	BannerAdUnit       string `json:"ba"`
-	InterstitialAdUnit string `json:"ia"`
-	NativeAdUnit       string `json:"na"`
-	AppOpenAdUnit      string `json:"oa"`
+// Banner represents a home-screen ad/promo banner slide
+type Banner struct {
+	ID       string `json:"id"`
+	ImageURL string `json:"image_url"`
+	LinkURL  string `json:"link_url"`
+	Title    string `json:"title"`
+	IsActive bool   `json:"is_active"`
+	SortOrder int   `json:"sort_order"`
 }
 
 // AppConfig is the complete configuration response
 type AppConfig struct {
 	AppVersion    AppVersion     `json:"av"`
 	InAppMessages []InAppMessage `json:"ms"`
-	AdConfig      AdConfig       `json:"ac"`
-	AdUnits       AdUnits        `json:"adu"`
+}
+
+// isDuplicateColumnError returns true when SQLite rejects an ALTER TABLE
+// because the column already exists.
+func isDuplicateColumnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "duplicate column name")
 }
 
 // InitDB initializes the SQLite database
@@ -70,13 +110,10 @@ func InitDB(dbPath string) error {
 	if err != nil {
 		return err
 	}
-
-	// Test connection
 	if err = db.Ping(); err != nil {
 		return err
 	}
 
-	// Create tables
 	createTables := `
 	CREATE TABLE IF NOT EXISTS app_version (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -88,6 +125,11 @@ func InitDB(dbPath string) error {
 		update_message TEXT NOT NULL,
 		whats_new TEXT NOT NULL,
 		release_date TEXT NOT NULL,
+		download_url TEXT NOT NULL DEFAULT '',
+		download_url_v8a TEXT NOT NULL DEFAULT '',
+		download_url_v7a TEXT NOT NULL DEFAULT '',
+		update_button_text TEXT NOT NULL DEFAULT 'ယခုဒေါင်းလုပ်',
+		later_button_text TEXT NOT NULL DEFAULT 'နောက်မှ',
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -108,27 +150,37 @@ func InitDB(dbPath string) error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
-	CREATE TABLE IF NOT EXISTS ad_config (
-		id INTEGER PRIMARY KEY CHECK (id = 1),
-		native_ad_timer_seconds INTEGER NOT NULL DEFAULT 60,
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE TABLE IF NOT EXISTS ad_units (
-		id INTEGER PRIMARY KEY CHECK (id = 1),
-		banner_ad_unit TEXT NOT NULL,
-		interstitial_ad_unit TEXT NOT NULL,
-		native_ad_unit TEXT NOT NULL,
-		app_open_ad_unit TEXT NOT NULL,
+	CREATE TABLE IF NOT EXISTS banners (
+		id TEXT PRIMARY KEY,
+		image_url TEXT NOT NULL,
+		link_url TEXT NOT NULL DEFAULT '',
+		title TEXT NOT NULL DEFAULT '',
+		is_active BOOLEAN NOT NULL DEFAULT 1,
+		sort_order INTEGER NOT NULL DEFAULT 0,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	`
-
 	if _, err = db.Exec(createTables); err != nil {
 		return err
 	}
 
-	// Insert default data if empty
+	// Migrate existing DB: add new columns if they don't exist yet
+	migrations := []string{
+		`ALTER TABLE app_version ADD COLUMN download_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE app_version ADD COLUMN download_url_v8a TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE app_version ADD COLUMN download_url_v7a TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE app_version ADD COLUMN update_button_text TEXT NOT NULL DEFAULT 'ယခုဒေါင်းလုပ်'`,
+		`ALTER TABLE app_version ADD COLUMN later_button_text TEXT NOT NULL DEFAULT 'နောက်မှ'`,
+	}
+	for _, m := range migrations {
+		if _, err = db.Exec(m); err != nil {
+			if !isDuplicateColumnError(err) {
+				return err
+			}
+		}
+	}
+
 	if err = insertDefaultData(); err != nil {
 		return err
 	}
@@ -137,7 +189,6 @@ func InitDB(dbPath string) error {
 	return nil
 }
 
-// insertDefaultData inserts default configuration if database is empty
 func insertDefaultData() error {
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM app_version").Scan(&count)
@@ -146,14 +197,12 @@ func insertDefaultData() error {
 	}
 
 	if count == 0 {
-		// Insert default app version
 		whatsNew := []string{
-			"🎯 Real-time 2D lottery live numbers",
-			"🎁 Gifts & rewards system",
-			"📰 Paper/Guide section with beautiful UI",
-			"📺 3D lottery live results",
-			"📅 Calendar and lottery history",
-			"🐛 Performance improvements and bug fixes",
+			"2D / 3D ထိုးကြေး Real-time နှင့် ကြည့်ရှုနိုင်",
+			"ငွေဖြည့် / ငွေထုတ် မှတ်တမ်းကြည့်နိုင်",
+			"မြန်မာဘာသာဖြင့် အသိပေးချက်များ",
+			"ဂဏန်းရလဒ်ထွက်သည့်အခါ notification ရနိုင်",
+			"Bug fixes and performance improvements",
 		}
 		whatsNewJSON, _ := json.Marshal(whatsNew)
 
@@ -161,68 +210,43 @@ func insertDefaultData() error {
 			INSERT INTO app_version (
 				id, latest_version, latest_version_code, minimum_version_code,
 				force_update, update_title, update_message,
-				whats_new, release_date
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				whats_new, release_date,
+				download_url, download_url_v8a, download_url_v7a,
+				update_button_text, later_button_text
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			1,
-			"1.0.1",
-			2,
-			1, // minimum supported version code
+			"1.0.0", 1, 1,
 			false,
-			"🎉 New Update Available!",
-			"We've added exciting new features and improvements to enhance your experience!",
+			"အပ်ဒိတ်အသစ်ရှိပါသည်",
+			"အသစ်သောအင်္ဂါရပ်များနှင့် တိုးတက်မှုများ ထည့်သွင်းထားပါသည်",
 			string(whatsNewJSON),
 			time.Now().Format("2006-01-02"),
+			"",  // download_url (universal fallback)
+			"",  // download_url_v8a — set via POST /api/power2d/config
+			"",  // download_url_v7a — set via POST /api/power2d/config
+			"ယခုဒေါင်းလုပ်",
+			"နောက်မှ",
 		)
 		if err != nil {
 			return err
 		}
 
-		// Insert default messages
 		messages := []InAppMessage{
 			{
-				ID:          "welcome_2026",
+				ID:          "welcome_power2d",
 				Type:        "info",
-				Title:       "🎊 Welcome to 2D Thu Ta!",
-				Message:     "Thank you for using 2D Thu Ta! We're committed to providing you with the best lottery experience. Check out our new features and enjoy real-time updates!",
+				Title:       "Power 2D မှ ကြိုဆိုပါသည်",
+				Message:     "Power2D သို့ ကြိုဆိုပါသည်။ 2D / 3D ထိုးနိုင်ပြီး ငွေဖြည့် / ငွေထုတ် လွယ်ကူစွာ ပြုလုပ်နိုင်ပါသည်",
 				ImageURL:    "",
 				ActionText:  "",
 				ActionURL:   "",
 				Priority:    5,
-				StartDate:   "2025-11-01",
-				EndDate:     "2025-12-31",
+				StartDate:   time.Now().Format("2006-01-02"),
+				EndDate:     "2099-12-31",
 				ShowOnce:    true,
 				Dismissible: true,
 			},
-			{
-				ID:          "promo_nov_2025",
-				Type:        "promo",
-				Title:       "🎁 Special November Offer!",
-				Message:     "Get access to premium features this month! Exclusive analysis, predictions, and more. Don't miss out on this limited-time offer!",
-				ImageURL:    "",
-				ActionText:  "Learn More",
-				ActionURL:   "https://play.google.com/store/apps/details?id=com.twod.thuta.twodthuta",
-				Priority:    10,
-				StartDate:   "2025-11-01",
-				EndDate:     "2025-11-30",
-				ShowOnce:    false,
-				Dismissible: true,
-			},
-			{
-				ID:          "maintenance_alert",
-				Type:        "warning",
-				Title:       "⚠️ Scheduled Maintenance",
-				Message:     "We'll be performing system maintenance on November 10th from 2:00 AM to 4:00 AM. The app may be temporarily unavailable during this time.",
-				ImageURL:    "",
-				ActionText:  "",
-				ActionURL:   "",
-				Priority:    8,
-				StartDate:   "2025-11-04",
-				EndDate:     "2025-11-10",
-				ShowOnce:    false,
-				Dismissible: true,
-			},
 		}
-
 		for _, msg := range messages {
 			_, err = db.Exec(`
 				INSERT INTO in_app_messages (
@@ -237,129 +261,70 @@ func insertDefaultData() error {
 				return err
 			}
 		}
-
 		log.Println("✅ Default data inserted")
 	}
-
-	// Insert default ad config if empty
-	var adCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM ad_config").Scan(&adCount)
-	if err != nil {
-		return err
-	}
-
-	if adCount == 0 {
-		_, err = db.Exec(`
-			INSERT INTO ad_config (id, native_ad_timer_seconds)
-			VALUES (1, 60)
-		`)
-		if err != nil {
-			return err
-		}
-		log.Println("✅ Default ad config inserted (60 seconds)")
-	}
-
-	// Insert default ad units if empty
-	var adUnitsCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM ad_units").Scan(&adUnitsCount)
-	if err != nil {
-		return err
-	}
-
-	if adUnitsCount == 0 {
-		_, err = db.Exec(`
-			INSERT INTO ad_units (
-				id, banner_ad_unit, interstitial_ad_unit, 
-				native_ad_unit, app_open_ad_unit
-			) VALUES (?, ?, ?, ?, ?)`,
-			1,
-			"ca-app-pub-3940256099942544/6300978111", // Test banner
-			"ca-app-pub-3940256099942544/1033173712", // Test interstitial
-			"ca-app-pub-3940256099942544/2247696110", // Test native
-			"ca-app-pub-3940256099942544/9257395921", // Test app open
-		)
-		if err != nil {
-			return err
-		}
-		log.Println("✅ Default ad units inserted (test ads)")
-	}
-
 	return nil
 }
 
-// GetAppVersion retrieves the app version from database
+// ── AppVersion CRUD ───────────────────────────────────────────────────────────
+
 func GetAppVersion() (*AppVersion, error) {
 	var version AppVersion
 	var whatsNewJSON string
-
 	err := db.QueryRow(`
 		SELECT latest_version, latest_version_code, minimum_version_code,
 		       force_update, update_title, update_message,
-		       whats_new, release_date
+		       whats_new, release_date,
+		       download_url, download_url_v8a, download_url_v7a,
+		       update_button_text, later_button_text
 		FROM app_version WHERE id = 1
 	`).Scan(
-		&version.LatestVersion,
-		&version.LatestVersionCode,
-		&version.MinimumVersionCode,
-		&version.ForceUpdate,
-		&version.UpdateTitle,
-		&version.UpdateMessage,
-		&whatsNewJSON,
-		&version.ReleaseDate,
+		&version.LatestVersion, &version.LatestVersionCode, &version.MinimumVersionCode,
+		&version.ForceUpdate, &version.UpdateTitle, &version.UpdateMessage,
+		&whatsNewJSON, &version.ReleaseDate,
+		&version.DownloadURL, &version.DownloadURLv8a, &version.DownloadURLv7a,
+		&version.UpdateButtonText, &version.LaterButtonText,
 	)
-
 	if err != nil {
 		return nil, err
 	}
-
-	// Parse whats_new JSON
 	if err = json.Unmarshal([]byte(whatsNewJSON), &version.WhatsNew); err != nil {
 		version.WhatsNew = []string{}
 	}
-
 	return &version, nil
 }
 
-// UpdateAppVersion updates the app version in database
 func UpdateAppVersion(version *AppVersion) error {
 	whatsNewJSON, err := json.Marshal(version.WhatsNew)
 	if err != nil {
 		return err
 	}
-
 	_, err = db.Exec(`
 		UPDATE app_version SET
-			latest_version = ?,
-			latest_version_code = ?,
-			minimum_version_code = ?,
-			force_update = ?,
-			update_title = ?,
-			update_message = ?,
-			whats_new = ?,
-			release_date = ?,
+			latest_version = ?, latest_version_code = ?, minimum_version_code = ?,
+			force_update = ?, update_title = ?, update_message = ?,
+			whats_new = ?, release_date = ?,
+			download_url = ?, download_url_v8a = ?, download_url_v7a = ?,
+			update_button_text = ?, later_button_text = ?,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = 1
 	`,
-		version.LatestVersion,
-		version.LatestVersionCode,
-		version.MinimumVersionCode,
-		version.ForceUpdate,
-		version.UpdateTitle,
-		version.UpdateMessage,
-		string(whatsNewJSON),
-		version.ReleaseDate,
+		version.LatestVersion, version.LatestVersionCode, version.MinimumVersionCode,
+		version.ForceUpdate, version.UpdateTitle, version.UpdateMessage,
+		string(whatsNewJSON), version.ReleaseDate,
+		version.DownloadURL, version.DownloadURLv8a, version.DownloadURLv7a,
+		version.UpdateButtonText, version.LaterButtonText,
 	)
-
 	return err
 }
 
-// GetInAppMessages retrieves all in-app messages from database
+// ── InAppMessage CRUD ─────────────────────────────────────────────────────────
+
 func GetInAppMessages() ([]InAppMessage, error) {
 	rows, err := db.Query(`
 		SELECT id, type, title, message, image_url, action_text, action_url,
 		       priority, start_date, end_date, show_once, dismissible
-		FROM in_app_messages
-		ORDER BY priority DESC
+		FROM in_app_messages ORDER BY priority DESC
 	`)
 	if err != nil {
 		return nil, err
@@ -370,7 +335,6 @@ func GetInAppMessages() ([]InAppMessage, error) {
 	for rows.Next() {
 		var msg InAppMessage
 		var imageURL, actionText, actionURL sql.NullString
-
 		err = rows.Scan(
 			&msg.ID, &msg.Type, &msg.Title, &msg.Message,
 			&imageURL, &actionText, &actionURL,
@@ -380,18 +344,14 @@ func GetInAppMessages() ([]InAppMessage, error) {
 		if err != nil {
 			return nil, err
 		}
-
 		msg.ImageURL = imageURL.String
 		msg.ActionText = actionText.String
 		msg.ActionURL = actionURL.String
-
 		messages = append(messages, msg)
 	}
-
 	return messages, nil
 }
 
-// UpsertInAppMessage inserts or updates an in-app message
 func UpsertInAppMessage(msg *InAppMessage) error {
 	_, err := db.Exec(`
 		INSERT INTO in_app_messages (
@@ -399,355 +359,468 @@ func UpsertInAppMessage(msg *InAppMessage) error {
 			priority, start_date, end_date, show_once, dismissible
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			type = excluded.type,
-			title = excluded.title,
-			message = excluded.message,
-			image_url = excluded.image_url,
-			action_text = excluded.action_text,
-			action_url = excluded.action_url,
-			priority = excluded.priority,
-			start_date = excluded.start_date,
-			end_date = excluded.end_date,
-			show_once = excluded.show_once,
-			dismissible = excluded.dismissible,
+			type = excluded.type, title = excluded.title, message = excluded.message,
+			image_url = excluded.image_url, action_text = excluded.action_text,
+			action_url = excluded.action_url, priority = excluded.priority,
+			start_date = excluded.start_date, end_date = excluded.end_date,
+			show_once = excluded.show_once, dismissible = excluded.dismissible,
 			updated_at = CURRENT_TIMESTAMP
 	`,
 		msg.ID, msg.Type, msg.Title, msg.Message, msg.ImageURL,
 		msg.ActionText, msg.ActionURL, msg.Priority, msg.StartDate,
 		msg.EndDate, msg.ShowOnce, msg.Dismissible,
 	)
-
 	return err
 }
 
-// DeleteInAppMessage deletes an in-app message by ID
 func DeleteInAppMessage(id string) error {
 	_, err := db.Exec("DELETE FROM in_app_messages WHERE id = ?", id)
 	return err
 }
 
-// GetAdConfig retrieves the ad configuration from database
-func GetAdConfig() (*AdConfig, error) {
-	var config AdConfig
+// ── Banner CRUD ───────────────────────────────────────────────────────────────
 
-	err := db.QueryRow(`
-		SELECT native_ad_timer_seconds
-		FROM ad_config WHERE id = 1
-	`).Scan(&config.NativeAdTimerSeconds)
-
+func GetBanners(activeOnly bool) ([]Banner, error) {
+	query := `SELECT id, image_url, link_url, title, is_active, sort_order FROM banners`
+	if activeOnly {
+		query += ` WHERE is_active = 1`
+	}
+	query += ` ORDER BY sort_order ASC, created_at ASC`
+	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
 	}
-
-	return &config, nil
-}
-
-// UpdateAdConfig updates the ad configuration in database
-func UpdateAdConfig(config *AdConfig) error {
-	_, err := db.Exec(`
-		UPDATE ad_config
-		SET native_ad_timer_seconds = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = 1
-	`, config.NativeAdTimerSeconds)
-
-	return err
-}
-
-// GetAdUnits retrieves the ad units from database
-func GetAdUnits() (*AdUnits, error) {
-	var units AdUnits
-
-	err := db.QueryRow(`
-		SELECT banner_ad_unit, interstitial_ad_unit, 
-		       native_ad_unit, app_open_ad_unit
-		FROM ad_units WHERE id = 1
-	`).Scan(&units.BannerAdUnit, &units.InterstitialAdUnit,
-		&units.NativeAdUnit, &units.AppOpenAdUnit)
-
-	if err != nil {
-		return nil, err
+	defer rows.Close()
+	var banners []Banner
+	for rows.Next() {
+		var b Banner
+		if err := rows.Scan(&b.ID, &b.ImageURL, &b.LinkURL, &b.Title, &b.IsActive, &b.SortOrder); err != nil {
+			return nil, err
+		}
+		banners = append(banners, b)
 	}
-
-	return &units, nil
+	if banners == nil {
+		banners = []Banner{}
+	}
+	return banners, nil
 }
 
-// UpdateAdUnits updates the ad units in database
-func UpdateAdUnits(units *AdUnits) error {
+func UpsertBanner(b *Banner) error {
 	_, err := db.Exec(`
-		UPDATE ad_units
-		SET banner_ad_unit = ?, interstitial_ad_unit = ?, 
-		    native_ad_unit = ?, app_open_ad_unit = ?,
-		    updated_at = CURRENT_TIMESTAMP
-		WHERE id = 1
-	`, units.BannerAdUnit, units.InterstitialAdUnit,
-		units.NativeAdUnit, units.AppOpenAdUnit)
-
+		INSERT INTO banners (id, image_url, link_url, title, is_active, sort_order)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			image_url = excluded.image_url,
+			link_url  = excluded.link_url,
+			title     = excluded.title,
+			is_active = excluded.is_active,
+			sort_order = excluded.sort_order,
+			updated_at = CURRENT_TIMESTAMP
+	`, b.ID, b.ImageURL, b.LinkURL, b.Title, b.IsActive, b.SortOrder)
 	return err
 }
 
-// GetAppConfigHandler returns the current app configuration
+func DeleteBanner(id string) error {
+	_, err := db.Exec("DELETE FROM banners WHERE id = ?", id)
+	return err
+}
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
 func GetAppConfigHandler(c *gin.Context) {
 	version, err := GetAppVersion()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get version: " + err.Error()})
 		return
 	}
-
 	messages, err := GetInAppMessages()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get messages: " + err.Error()})
 		return
 	}
-
-	adConfig, err := GetAdConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get ad config: " + err.Error()})
-		return
-	}
-
-	adUnits, err := GetAdUnits()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get ad units: " + err.Error()})
-		return
-	}
-
-	config := AppConfig{
-		AppVersion:    *version,
-		InAppMessages: messages,
-		AdConfig:      *adConfig,
-		AdUnits:       *adUnits,
-	}
-
-	c.JSON(http.StatusOK, config)
-	log.Printf("✅ App config sent to client (ad timer: %d seconds)\n", adConfig.NativeAdTimerSeconds)
+	c.JSON(http.StatusOK, AppConfig{AppVersion: *version, InAppMessages: messages})
+	log.Println("✅ App config sent to client")
 }
 
-// UpdateAppConfigHandler allows updating the configuration
 func UpdateAppConfigHandler(c *gin.Context) {
 	var newConfig AppConfig
 	if err := c.ShouldBindJSON(&newConfig); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	// Update app version
 	if err := UpdateAppVersion(&newConfig.AppVersion); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update version: " + err.Error()})
 		return
 	}
-
-	// Delete all existing messages and insert new ones
 	if _, err := db.Exec("DELETE FROM in_app_messages"); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clear messages: " + err.Error()})
 		return
 	}
-
-	// Insert new messages
 	for _, msg := range newConfig.InAppMessages {
 		if err := UpsertInAppMessage(&msg); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to insert message: " + err.Error()})
 			return
 		}
 	}
-
-	// Update ad config
-	if err := UpdateAdConfig(&newConfig.AdConfig); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update ad config: " + err.Error()})
-		return
-	}
-
-	// Update ad units
-	if err := UpdateAdUnits(&newConfig.AdUnits); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update ad units: " + err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Configuration updated successfully",
-		"config":  newConfig,
-	})
-	log.Printf("✅ App config updated in database (ad timer: %d seconds)\n", newConfig.AdConfig.NativeAdTimerSeconds)
+	c.JSON(http.StatusOK, gin.H{"message": "Configuration updated successfully", "config": newConfig})
+	log.Println("✅ App config updated")
 }
 
-// GetAdConfigOnlyHandler returns only ad configuration
-func GetAdConfigOnlyHandler(c *gin.Context) {
-	adConfig, err := GetAdConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, adConfig)
-	log.Printf("✅ Ad config sent (timer: %d seconds)", adConfig.NativeAdTimerSeconds)
-}
-
-// UpdateAdConfigOnlyHandler updates only the ad configuration
-func UpdateAdConfigOnlyHandler(c *gin.Context) {
-	var adConfig AdConfig
-	if err := c.ShouldBindJSON(&adConfig); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Validate timer value (must be between 30 and 300 seconds)
-	if adConfig.NativeAdTimerSeconds < 30 || adConfig.NativeAdTimerSeconds > 300 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Timer must be between 30 and 300 seconds"})
-		return
-	}
-
-	if err := UpdateAdConfig(&adConfig); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Ad config updated successfully",
-		"nt":      adConfig.NativeAdTimerSeconds,
-	})
-	log.Printf("✅ Ad timer updated to %d seconds", adConfig.NativeAdTimerSeconds)
-}
-
-// GetAdUnitsOnlyHandler returns only ad units
-func GetAdUnitsOnlyHandler(c *gin.Context) {
-	units, err := GetAdUnits()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, units)
-	log.Println("✅ Ad units info sent")
-}
-
-// UpdateAdUnitsHandler updates ad units configuration
-func UpdateAdUnitsHandler(c *gin.Context) {
-	var units AdUnits
-	if err := c.ShouldBindJSON(&units); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Validate ad unit IDs (must not be empty)
-	if units.BannerAdUnit == "" || units.InterstitialAdUnit == "" ||
-		units.NativeAdUnit == "" || units.AppOpenAdUnit == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "All ad unit IDs must be provided"})
-		return
-	}
-
-	if err := UpdateAdUnits(&units); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Ad units updated successfully",
-		"ba":      units.BannerAdUnit,
-		"ia":      units.InterstitialAdUnit,
-		"na":      units.NativeAdUnit,
-		"oa":      units.AppOpenAdUnit,
-	})
-	log.Println("✅ Ad units updated successfully")
-}
-
-// GetAppVersionHandler returns only version information
 func GetAppVersionHandler(c *gin.Context) {
 	version, err := GetAppVersion()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-
 	c.JSON(http.StatusOK, version)
 	log.Println("✅ App version info sent")
 }
 
-// GetInAppMessagesHandler returns only active messages
 func GetInAppMessagesHandler(c *gin.Context) {
 	messages, err := GetInAppMessages()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-
 	c.JSON(http.StatusOK, messages)
 	log.Println("✅ In-app messages sent")
 }
 
+// ── Banner Handlers ───────────────────────────────────────────────────────────
+
+func GetBannersHandler(c *gin.Context) {
+	banners, err := GetBanners(true) // active only for Flutter app
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, banners)
+}
+
+func GetAllBannersHandler(c *gin.Context) {
+	banners, err := GetBanners(false) // all banners for admin
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, banners)
+}
+
+func UpsertBannerHandler(c *gin.Context) {
+	var b Banner
+	if err := c.ShouldBindJSON(&b); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// For PUT /admin/banners/:id, use the URL param as the ID
+	if pathID := c.Param("id"); pathID != "" {
+		b.ID = pathID
+	}
+	if b.ID == "" {
+		b.ID = fmt.Sprintf("banner_%d", time.Now().UnixNano())
+	}
+	if err := UpsertBanner(&b); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	log.Printf("✅ Banner upserted: %s", b.ID)
+	c.JSON(http.StatusOK, b)
+}
+
+func DeleteBannerHandler(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "id required"})
+		return
+	}
+	if err := DeleteBanner(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	log.Printf("✅ Banner deleted: %s", id)
+	c.JSON(http.StatusOK, gin.H{"message": "deleted"})
+}
+
+// ── Rate limiter ─────────────────────────────────────────────────────────────
+
+type rateBucket struct {
+	count    int
+	resetAt  time.Time
+}
+
+var (
+	rateMu      sync.Mutex
+	rateBuckets = make(map[string]*rateBucket)
+)
+
+const (
+	rateWindow   = time.Minute
+	rateMaxReads = 60  // Flutter app polling — generous
+	rateMaxAdmin = 20  // Admin writes — strict
+)
+
+func clientIP(c *gin.Context) string {
+	if ip := c.GetHeader("X-Forwarded-For"); ip != "" {
+		return strings.Split(ip, ",")[0]
+	}
+	return c.ClientIP()
+}
+
+func checkRate(ip string, max int) bool {
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	b, ok := rateBuckets[ip]
+	if !ok || time.Now().After(b.resetAt) {
+		rateBuckets[ip] = &rateBucket{count: 1, resetAt: time.Now().Add(rateWindow)}
+		return true
+	}
+	if b.count >= max {
+		return false
+	}
+	b.count++
+	return true
+}
+
+// ── Middleware ────────────────────────────────────────────────────────────────
+
+// readKeyMiddleware: allows Flutter app (read-only key) OR admin key for GET endpoints.
+func readKeyMiddleware(readKey, adminKey string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ip := clientIP(c)
+		if !checkRate(ip, rateMaxReads) {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
+			return
+		}
+		provided := c.GetHeader("X-API-Key")
+		if provided == "" {
+			provided = c.Query("api_key")
+		}
+		// Also accept the admin key on GET routes (admin dashboard needs to load config)
+		adminProvided := c.GetHeader("X-Admin-Key")
+		if provided != readKey && adminProvided != adminKey {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// adminKeyMiddleware: only accepts the admin write key — never shared with apps.
+func adminKeyMiddleware(adminKey string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ip := clientIP(c)
+		if !checkRate(ip+":admin", rateMaxAdmin) {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
+			return
+		}
+		provided := c.GetHeader("X-Admin-Key")
+		if provided == "" || provided != adminKey {
+			// Log suspicious attempts
+			log.Printf("[SECURITY] ⚠️  Rejected admin write attempt from %s", ip)
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// ── Image Upload ──────────────────────────────────────────────────────────────
+
+func UploadImageHandler(c *gin.Context) {
+	file, header, err := c.Request.FormFile("image")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no image file provided"})
+		return
+	}
+	defer file.Close()
+
+	// Only allow images
+	ct := header.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "image/") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "only image files are allowed"})
+		return
+	}
+
+	// Build unique filename: timestamp + original name
+	ext := ".jpg"
+	if idx := strings.LastIndex(header.Filename, "."); idx >= 0 {
+		ext = header.Filename[idx:]
+	}
+	filename := fmt.Sprintf("%d%s", time.Now().UnixNano(), ext)
+	savePath := "./uploads/" + filename
+
+	if err := os.MkdirAll("./uploads", 0755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create uploads dir"})
+		return
+	}
+
+	out, err := os.Create(savePath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not save file"})
+		return
+	}
+	defer out.Close()
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := file.Read(buf)
+		if n > 0 {
+			if _, writeErr := out.Write(buf[:n]); writeErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "write error"})
+				return
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+
+	// Return the public URL
+	scheme := "http"
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
+	// Use PUBLIC_URL env var if set (needed when server is behind proxy or accessed from phones)
+	publicURL := os.Getenv("PUBLIC_URL")
+	var url string
+	if publicURL != "" {
+		url = fmt.Sprintf("%s/uploads/%s", strings.TrimRight(publicURL, "/"), filename)
+	} else {
+		host := c.Request.Host
+		url = fmt.Sprintf("%s://%s/uploads/%s", scheme, host, filename)
+	}
+	log.Printf("✅ Image uploaded: %s", url)
+	c.JSON(http.StatusOK, gin.H{"url": url})
+}
+
+// fixLocalhostURLs replaces localhost/127.0.0.1 image URLs stored in the DB
+// with the correct PUBLIC_URL. Runs once on startup.
+func fixLocalhostURLs(publicURL string) {
+	pub := strings.TrimRight(publicURL, "/")
+	// Replace both localhost:PORT and 127.0.0.1:PORT variants
+	replacements := []string{
+		"http://localhost:4598",
+		"https://localhost:4598",
+		"http://127.0.0.1:4598",
+		"https://127.0.0.1:4598",
+	}
+	total := 0
+	for _, old := range replacements {
+		res, err := db.Exec(
+			`UPDATE in_app_messages SET image_url = REPLACE(image_url, ?, ?) WHERE image_url LIKE ?`,
+			old, pub, "%"+old+"%",
+		)
+		if err == nil {
+			n, _ := res.RowsAffected()
+			total += int(n)
+		}
+		res2, err2 := db.Exec(
+			`UPDATE banners SET image_url = REPLACE(image_url, ?, ?) WHERE image_url LIKE ?`,
+			old, pub, "%"+old+"%",
+		)
+		if err2 == nil {
+			n, _ := res2.RowsAffected()
+			total += int(n)
+		}
+	}
+	if total > 0 {
+		log.Printf("✅ Fixed %d image URL(s): localhost → %s", total, pub)
+	}
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
 func main() {
-	// Initialize database
+	// Load .env file first (values are ignored if already set by OS env)
+	loadEnvFile(".env")
+
 	dbPath := "./appconfig.db"
 	if err := InitDB(dbPath); err != nil {
 		log.Fatal("❌ Failed to initialize database: ", err)
 	}
 	defer db.Close()
 
-	// Set Gin to release mode
-	gin.SetMode(gin.ReleaseMode)
+	// Fix any stored localhost image URLs → use real PUBLIC_URL
+	publicURL := os.Getenv("PUBLIC_URL")
+	if publicURL != "" {
+		fixLocalhostURLs(publicURL)
+	}
 
+	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
-	// CORS configuration
+	// Read keys from environment
+	readKey := os.Getenv("POWER2D_READ_KEY")
+	if readKey == "" {
+		readKey = "power2d-client-readonly-2026"
+		log.Printf("⚠️  POWER2D_READ_KEY not set — using default (change in production!)")
+	}
+	adminKey := os.Getenv("POWER2D_ADMIN_KEY")
+	if adminKey == "" {
+		adminKey = "power2d-admin-write-2026-secret"
+		log.Printf("⚠️  POWER2D_ADMIN_KEY not set — using default (MUST change in production!)")
+	}
+	log.Printf("🔑 Two-key security enabled (read + admin write)")
+
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:  []string{"*"},
 		AllowMethods:  []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:  []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		AllowHeaders:  []string{"Origin", "Content-Type", "Accept", "X-API-Key", "X-Admin-Key"},
 		ExposeHeaders: []string{"Content-Length"},
 		MaxAge:        12 * time.Hour,
 	}))
 
-	// API Routes
-	api := r.Group("/api/2dthuta")
+	api := r.Group("/api/power2d")
 	{
-		// Main config endpoint (used by Android app)
-		api.GET("/config", GetAppConfigHandler)
+		// READ routes — Flutter app uses X-API-Key (read-only) OR admin dashboard uses X-Admin-Key
+		api.GET("/config", readKeyMiddleware(readKey, adminKey), GetAppConfigHandler)
+		api.GET("/version", readKeyMiddleware(readKey, adminKey), GetAppVersionHandler)
+		api.GET("/messages", readKeyMiddleware(readKey, adminKey), GetInAppMessagesHandler)
+		api.GET("/banners", readKeyMiddleware(readKey, adminKey), GetBannersHandler)          // Flutter: active banners only
 
-		// Individual endpoints
-		api.GET("/version", GetAppVersionHandler)
-		api.GET("/messages", GetInAppMessagesHandler)
-		api.GET("/adconfig", GetAdConfigOnlyHandler)
-
-		// Admin endpoint to update config
-		api.POST("/config", UpdateAppConfigHandler)
-		api.POST("/adconfig", UpdateAdConfigOnlyHandler)
-
-		// Ad units endpoints
-		api.GET("/adunits", GetAdUnitsOnlyHandler)
-		api.POST("/adunits", UpdateAdUnitsHandler)
+		// WRITE routes — Admin dashboard only, uses X-Admin-Key (never in APK)
+		api.POST("/config", adminKeyMiddleware(adminKey), UpdateAppConfigHandler)
+		api.GET("/admin/banners", adminKeyMiddleware(adminKey), GetAllBannersHandler)         // Admin: all banners
+		api.POST("/admin/banners", adminKeyMiddleware(adminKey), UpsertBannerHandler)         // Admin: create/update
+		api.PUT("/admin/banners/:id", adminKeyMiddleware(adminKey), UpsertBannerHandler)      // Admin: update
+		api.DELETE("/admin/banners/:id", adminKeyMiddleware(adminKey), DeleteBannerHandler)   // Admin: delete
 	}
 
-	// Health check
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"status":   "healthy",
-			"time":     time.Now().Format(time.RFC3339),
-			"database": "sqlite3",
+			"status": "healthy",
+			"time":   time.Now().Format(time.RFC3339),
+			"db":     "sqlite3",
 		})
 	})
 
-	// Root endpoint
+	// Serve uploaded images statically — e.g. http://localhost:4598/uploads/abc.jpg
+	if err := os.MkdirAll("./uploads", 0755); err != nil {
+		log.Printf("⚠️  Could not create uploads dir: %v", err)
+	}
+	r.Static("/uploads", "./uploads")
+
+	// Image upload — admin key required
+	r.POST("/api/power2d/upload-image", adminKeyMiddleware(adminKey), UploadImageHandler)
+
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"name":     "2D Thu Ta - App Config Server",
-			"version":  "1.0.0",
-			"status":   "running",
-			"database": "SQLite3",
+			"name":    "Power 2D - App Config Server",
+			"version": "2.0.0",
+			"status":  "running",
 			"endpoints": []string{
-				"GET  /api/2dthuta/config   - Get full app configuration",
-				"GET  /api/2dthuta/version  - Get version info only",
-				"GET  /api/2dthuta/messages - Get in-app messages only",
-				"POST /api/2dthuta/config   - Update configuration (admin)",
+				"GET  /api/power2d/config   - Full config (version + messages)",
+				"POST /api/power2d/config   - Update config (admin)",
+				"GET  /api/power2d/version  - Version check only",
+				"GET  /api/power2d/messages - In-app messages only",
 				"GET  /health               - Health check",
 			},
 		})
 	})
 
 	port := "4598"
-	log.Printf("🚀 2D Thu Ta App Config Server starting on port %s...\n", port)
-	log.Printf("📡 Main endpoint: http://localhost:%s/api/2dthuta/config\n", port)
-	log.Printf("💾 Database: %s (SQLite3)\n", dbPath)
-	log.Printf("🏥 Health check:  http://localhost:%s/health\n", port)
-	log.Println("✅ Server ready to serve app configuration!")
-
+	log.Printf("🚀 Power 2D Config Server on port %s\n", port)
+	log.Printf("📡 http://localhost:%s/api/power2d/config\n", port)
 	if err := r.Run(":" + port); err != nil {
 		log.Fatal("❌ Failed to start server: ", err)
 	}
